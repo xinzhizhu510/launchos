@@ -1,0 +1,4 @@
+.DS_Store
+/LaunchOS.app/
+/.launchos-build.*
+*.zip

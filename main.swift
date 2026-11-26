@@ -5,6 +5,8 @@ import ServiceManagement
 struct Item {
     let url: URL
     let name: String
+    let identifier: String
+
     static func installed() -> [Item] {
         let fm = FileManager.default
         var items = [Item]()
@@ -15,13 +17,49 @@ struct Item {
             for case let url as URL in files where url.pathExtension == "app" {
                 files.skipDescendants()
                 guard let bundle = Bundle(url: url), bundle.executableURL != nil,
-                      bundle.bundleIdentifier != Bundle.main.bundleIdentifier,
-                      seen.insert(bundle.bundleIdentifier ?? url.path).inserted else { continue }
+                      bundle.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
+                let identifier = bundle.bundleIdentifier ?? url.path
+                guard seen.insert(identifier).inserted else { continue }
                 let display = fm.displayName(atPath: url.path)
-                items.append(Item(url: url, name: display.hasSuffix(".app") ? String(display.dropLast(4)) : display))
+                let name = display.hasSuffix(".app") ? String(display.dropLast(4)) : display
+                items.append(Item(url: url, name: name, identifier: identifier))
             }
         }
         return items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+}
+
+struct AppUsage: Codable {
+    var days: [Int: Int] = [:]
+    var lastOpened: Date = .distantPast
+
+    private static func day(_ date: Date) -> Int {
+        Int(floor(date.timeIntervalSince1970 / 86_400))
+    }
+
+    mutating func record(at date: Date) {
+        let today = Self.day(date)
+        days = days.filter { $0.key >= today - 29 && $0.key <= today }
+        days[today, default: 0] += 1
+        lastOpened = date
+    }
+
+    func count(at date: Date) -> Int {
+        let today = Self.day(date)
+        return days.reduce(0) { $0 + ((today - 29...today).contains($1.key) ? $1.value : 0) }
+    }
+
+    static func frequentlyOpened(_ apps: [Item], usage: [String: AppUsage], at date: Date) -> [Item] {
+        let ranked = apps.compactMap { app -> (app: Item, count: Int, lastOpened: Date)? in
+            guard let activity = usage[app.identifier] else { return nil }
+            let opens = activity.count(at: date)
+            return opens > 0 ? (app, opens, activity.lastOpened) : nil
+        }.sorted { first, second in
+            if first.count != second.count { return first.count > second.count }
+            if first.lastOpened != second.lastOpened { return first.lastOpened > second.lastOpened }
+            return first.app.name.localizedStandardCompare(second.app.name) == .orderedAscending
+        }
+        return ranked.prefix(24).map { $0.app }
     }
 }
 
@@ -103,6 +141,12 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     let searchSurface = SearchSurface()
     let pageIndicators = NSView()
     let search = NSTextField()
+    let libraryTabs = NSSegmentedControl(
+        labels: ["全部应用", "最近常用"], trackingMode: .selectOne, target: nil, action: nil
+    )
+    var appUsage: [String: AppUsage] = [:]
+    var launchObserver: NSObjectProtocol?
+    var showingFrequentApps: Bool { libraryTabs.selectedSegment == 1 }
     let clearSearch = NSButton()
     var dragStart: NSPoint?
     var pressedTile: AppTile?
@@ -166,6 +210,18 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
            let decoded = try? JSONDecoder().decode(Shortcut.self, from: saved) {
             shortcut = decoded
         }
+        if let data = defaults.data(forKey: "appUsage"),
+           let saved = try? JSONDecoder().decode([String: AppUsage].self, from: data) {
+            appUsage = saved
+        }
+        launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  app.activationPolicy == .regular,
+                  let identifier = app.bundleIdentifier ?? app.bundleURL?.path else { return }
+            self?.recordOpen(identifier)
+        }
         configureToolbar()
         installHotKey()
         results = apps
@@ -216,6 +272,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             if !wasVisible {
                 animateEntrance(searchSurface, offset: 10, scale: 0.985, delay: 0.025, duration: 0.27)
                 animateEntrance(settings, offset: 8, scale: 0.985, delay: 0.025, duration: 0.27)
+                animateEntrance(libraryTabs, offset: 8, scale: 0.985, delay: 0.045, duration: 0.27)
                 animateEntrance(grid, offset: 17, scale: 0.98, delay: 0.045, duration: 0.32)
                 animateEntrance(pageIndicators, offset: 0, scale: 1, delay: 0.10, duration: 0.19)
             } else {
@@ -287,7 +344,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     func clearPresentationAnimations() {
-        for view in [searchSurface, settings, grid, pageIndicators] {
+        for view in [searchSurface, settings, libraryTabs, grid, pageIndicators] {
             view.layer?.removeAnimation(forKey: "launcherEntrance")
         }
     }
@@ -399,6 +456,16 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         searchSurface.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.22).cgColor
         searchSurface.field = search
         background.addSubview(searchSurface)
+
+        libraryTabs.frame = NSRect(x: bounds.midX - 106, y: top - 32, width: 212, height: 24)
+        libraryTabs.segmentStyle = .rounded
+        libraryTabs.selectedSegment = 0
+        libraryTabs.target = self
+        libraryTabs.action = #selector(changeLibraryTab)
+        libraryTabs.setWidth(104, forSegment: 0)
+        libraryTabs.setWidth(104, forSegment: 1)
+        libraryTabs.setAccessibilityLabel("应用页签")
+        background.addSubview(libraryTabs)
 
         let magnifier = NSImageView(frame: NSRect(x: 16, y: (height - 18) / 2, width: 18, height: 18))
         magnifier.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
@@ -623,6 +690,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             pressedTile = nil
             if searchSurface.frame.contains(backgroundPoint)
                 || settings.frame.contains(backgroundPoint)
+                || libraryTabs.frame.contains(backgroundPoint)
                 || pageIndicators.hitTest(backgroundPoint) is NSButton {
                 return event
             }
@@ -666,13 +734,37 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         updateSearch()
         window.makeFirstResponder(search)
     }
+    @objc func changeLibraryTab() {
+        search.stringValue = ""
+        updateSearch()
+        window.makeFirstResponder(search)
+    }
     func controlTextDidChange(_ notification: Notification) { updateSearch() }
     func updateSearch() {
         let q = search.stringValue
         clearSearch.isHidden = q.isEmpty
-        results = q.isEmpty ? apps : apps.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.url.lastPathComponent.localizedCaseInsensitiveContains(q) }
+        if q.isEmpty {
+            results = showingFrequentApps ? AppUsage.frequentlyOpened(apps, usage: appUsage, at: Date()) : apps
+        } else {
+            results = apps.filter {
+                $0.name.localizedCaseInsensitiveContains(q) || $0.url.lastPathComponent.localizedCaseInsensitiveContains(q)
+            }
+        }
         page = 0
         drawPage()
+    }
+    func recordOpen(_ identifier: String) {
+        guard apps.contains(where: { $0.identifier == identifier }) else { return }
+        let now = Date()
+        var usage = appUsage[identifier] ?? AppUsage()
+        // A LaunchOS click can also generate a workspace launch notification.
+        let elapsed = now.timeIntervalSince(usage.lastOpened)
+        guard elapsed < 0 || elapsed >= 2 else { return }
+        usage.record(at: now)
+        appUsage[identifier] = usage
+        if let data = try? JSONEncoder().encode(appUsage) {
+            defaults.set(data, forKey: "appUsage")
+        }
     }
     var capacity: Int { columns * rows }
     func go(_ index: Int) {
@@ -724,7 +816,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             grid.addSubview(tile)
         }
         if results.isEmpty {
-            let label = NSTextField(labelWithString: "没有找到应用")
+            let message = showingFrequentApps && search.stringValue.isEmpty
+                ? "打开应用后，常用应用会显示在这里"
+                : "没有找到应用"
+            let label = NSTextField(labelWithString: message)
             label.sizeToFit()
             label.setFrameOrigin(NSPoint(x: grid.bounds.midX-label.frame.width/2,y: grid.bounds.midY))
             grid.addSubview(label)
@@ -756,10 +851,14 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     @objc func submit() { launch(page * capacity) }
     func launch(_ index: Int) {
         guard results.indices.contains(index) else { return }
-        NSWorkspace.shared.openApplication(at: results[index].url, configuration: .init()) { [weak self] _, error in
+        let item = results[index]
+        NSWorkspace.shared.openApplication(at: item.url, configuration: .init()) { [weak self] _, error in
             DispatchQueue.main.async {
                 if let error { NSAlert(error: error).runModal() }
-                else { self?.closeLauncher(animated: false) }
+                else {
+                    self?.recordOpen(item.identifier)
+                    self?.closeLauncher(animated: false)
+                }
             }
         }
     }

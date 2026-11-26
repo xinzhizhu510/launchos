@@ -2,3 +2,4 @@
 /LaunchOS.app/
 /.launchos-build.*
 *.zip
+/dist/

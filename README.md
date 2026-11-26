@@ -5,6 +5,7 @@
 ## 功能
 
 - 全屏分页网格，默认 **4 行 × 7 列**，支持调整行列数。
+- 「最近常用」按近 30 天的打开次数排序，最多显示 24 个应用。记录保存在本机，从 LaunchOS 打开应用或在 LaunchOS 运行时启动应用才会计入。
 - 打开后可直接输入应用名称，按回车启动当前页的第一个搜索结果。
 - 支持触控板左右滑动、鼠标左右拖动、底部页码和方向键翻页。搜索框为空时可用方向键翻页。
 - 点击空白处或按 `Esc` 收起，应用留在后台等待下次唤起。
@@ -19,7 +20,9 @@
 
 ## 构建和安装
 
-在源码目录执行：
+可在 [GitHub Releases](https://github.com/xinzhizhu510/launchos/releases) 下载已发布的 DMG。打开后，把 LaunchOS 拖到「应用程序」。
+
+从源码构建时，在项目目录执行：
 
 ```sh
 ./build.command
@@ -34,6 +37,16 @@ open LaunchOS.app
 - 在右上角齿轮中点击当前快捷键，分别选择修饰键和主键，再保存。若组合键已被系统或其他应用占用，LaunchOS 会保留原设置。
 - 若想使用 **`⌘空格`**，先在「系统设置 → 键盘 → 键盘快捷键 → 聚焦」中取消勾选「显示‘聚焦’搜索」，再到 LaunchOS 保存该组合键。
 - 在齿轮设置里启用「登录时启动」，macOS 登录后会在后台开启 LaunchOS。
+
+## 自动发布
+
+1. 把 `Resources/Info.plist` 中的版本号和构建号随源码更新到 GitHub。
+2. 在 [GitHub Releases](https://github.com/xinzhizhu510/launchos/releases/new) 新建 Release，选择与应用版本对应的新标签，例如 `v0.2.2`，并将标签指向对应的源码提交。
+3. 发布后，可到 [Actions](https://github.com/xinzhizhu510/launchos/actions) 查看进度。构建成功后，`LaunchOS-<版本>-arm64.dmg` 会出现在对应 Release 的附件中。
+
+通过 Git 推送新标签也会触发相同流程。已有同名附件会保留。构建使用临时签名，尚未进行 Apple 公证。
+
+本地只需生成和校验 DMG 时，运行 `./release.command`，输出位于 `dist/`。
 
 ## 开发与贡献
 

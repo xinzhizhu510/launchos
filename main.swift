@@ -2,30 +2,68 @@ import AppKit
 import Carbon
 import ServiceManagement
 
-struct Item {
+struct Item: Equatable {
     let url: URL
     let name: String
     let identifier: String
 
-    static func installed() -> [Item] {
+    static let userApplicationFolders = ["~/Applications", "/Applications"].map {
+        URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath, isDirectory: true)
+    }
+    static let applicationFolders = userApplicationFolders + [URL(fileURLWithPath: "/System/Applications", isDirectory: true)]
+
+    var canMoveToTrash: Bool {
+        guard identifier != Bundle.main.bundleIdentifier,
+              let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+              values.isDirectory == true, values.isSymbolicLink == false else { return false }
+        let resolvedPath = url.resolvingSymlinksInPath().path
+        guard !resolvedPath.hasPrefix("/System/") else { return false }
+        return Self.userApplicationFolders.contains {
+            resolvedPath.hasPrefix($0.resolvingSymlinksInPath().path + "/")
+        }
+    }
+
+    static func installed(in folders: [URL] = applicationFolders) -> [Item] {
         let fm = FileManager.default
-        var items = [Item]()
-        var seen = Set<String>()
-        for path in ["~/Applications", "/Applications", "/System/Applications"] {
-            let root = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+        var items = [String: Item]()
+        for root in folders {
             guard let files = fm.enumerator(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
-            for case let url as URL in files where url.pathExtension == "app" {
+            for case let url as URL in files where url.pathExtension.lowercased() == "app" {
                 files.skipDescendants()
                 guard let bundle = Bundle(url: url), bundle.executableURL != nil,
                       bundle.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
                 let identifier = bundle.bundleIdentifier ?? url.path
-                guard seen.insert(identifier).inserted else { continue }
+                if let current = items[identifier], !isNewer(url, than: current.url) { continue }
                 let display = fm.displayName(atPath: url.path)
                 let name = display.hasSuffix(".app") ? String(display.dropLast(4)) : display
-                items.append(Item(url: url, name: name, identifier: identifier))
+                items[identifier] = Item(url: url, name: name, identifier: identifier)
             }
         }
-        return items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return items.values.sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.url.path < $1.url.path : order == .orderedAscending
+        }
+    }
+
+    static func isNewer(_ candidate: URL, than current: URL) -> Bool {
+        func versionInfo(_ url: URL) -> [String: Any] {
+            // Read the plist rather than cached Bundle metadata when a copy may have been updated in place.
+            let plist = url.appendingPathComponent("Contents/Info.plist")
+            guard let data = try? Data(contentsOf: plist),
+                  let info = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+            else { return [:] }
+            return info as? [String: Any] ?? [:]
+        }
+
+        let candidateInfo = versionInfo(candidate)
+        let currentInfo = versionInfo(current)
+        for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+            let left = candidateInfo[key] as? String ?? ""
+            let right = currentInfo[key] as? String ?? ""
+            let comparison = left.compare(right, options: .numeric)
+            if comparison != .orderedSame { return comparison == .orderedDescending }
+        }
+        return false
     }
 }
 
@@ -151,6 +189,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var dragStart: NSPoint?
     var pressedTile: AppTile?
     var dragDistance: CGFloat = 0
+    var longPress: DispatchWorkItem?
+    var isEditingApps = false
+    var catalogTimer: Timer?
+    let doneEditing = NSButton()
     let settings = NSButton()
     let preferences = NSPopover()
     let defaults = UserDefaults.standard
@@ -171,7 +213,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     let columnOptions = 3...10
     var rows = 4
     var columns = 7
-    let apps = Item.installed()
+    var apps: [Item] = []
     var results = [Item]()
     var page = 0
     var pages = 1
@@ -220,12 +262,14 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
                   app.activationPolicy == .regular,
                   let identifier = app.bundleIdentifier ?? app.bundleURL?.path else { return }
-            self?.recordOpen(identifier)
+            guard let self else { return }
+            if !self.apps.contains(where: { $0.identifier == identifier }) && self.dragStart == nil {
+                self.refreshCatalog()
+            }
+            self.recordOpen(identifier)
         }
         configureToolbar()
         installHotKey()
-        results = apps
-        drawPage()
         monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .scrollWheel, .swipe, .leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
             guard let self else { return event }
             return self.handle(event)
@@ -256,7 +300,12 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         presentationID += 1
         isPresented = true
         search.stringValue = ""
+        apps = Item.installed()
         updateSearch()
+        catalogTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            guard let self, self.dragStart == nil, self.window.attachedSheet == nil, NSApp.modalWindow == nil else { return }
+            self.refreshCatalog()
+        }
 
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         let wasVisible = window.isVisible
@@ -295,6 +344,12 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         presentationID += 1
         let closingID = presentationID
         isPresented = false
+        catalogTimer?.invalidate()
+        catalogTimer = nil
+        resetPointerInteraction()
+        if let sheet = window.attachedSheet { window.endSheet(sheet, returnCode: .cancel) }
+        isEditingApps = false
+        doneEditing.isHidden = true
         preferences.close()
         shortcutEditor.isHidden = true
 
@@ -509,6 +564,14 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         styleControl(settings, radius: 14)
         background.addSubview(settings)
 
+        doneEditing.title = "完成"
+        doneEditing.bezelStyle = .rounded
+        doneEditing.frame = NSRect(x: settings.frame.minX - 78, y: top + 8, width: 68, height: 28)
+        doneEditing.target = self
+        doneEditing.action = #selector(finishEditingApps)
+        doneEditing.isHidden = true
+        background.addSubview(doneEditing)
+
         let content = NSViewController()
         content.view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 309))
         let title = NSTextField(labelWithString: "网格设置")
@@ -638,8 +701,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     func handle(_ event: NSEvent) -> NSEvent? {
+        guard NSApp.modalWindow == nil, window?.attachedSheet == nil else { return event }
         if event.type == .keyDown, event.keyCode == 53, NSApp.isActive {
-            closeLauncher()
+            if isEditingApps { finishEditingApps() }
+            else { closeLauncher() }
             return nil
         }
         guard event.window === window, isPresented else { return event }
@@ -686,29 +751,42 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let backgroundPoint = grid.convert(point, to: background)
         switch event.type {
         case .leftMouseDown:
-            dragStart = nil
-            pressedTile = nil
+            resetPointerInteraction()
             if searchSurface.frame.contains(backgroundPoint)
                 || settings.frame.contains(backgroundPoint)
                 || libraryTabs.frame.contains(backgroundPoint)
+                || (!doneEditing.isHidden && doneEditing.frame.contains(backgroundPoint))
                 || pageIndicators.hitTest(backgroundPoint) is NSButton {
                 return event
             }
-            let tile = grid.hitTest(backgroundPoint) as? AppTile
+            let hit = grid.hitTest(backgroundPoint)
+            let tile = hit as? AppTile
+            if hit is NSButton && tile == nil { return event }
             if preferences.isShown && tile != nil { return event }
             dragStart = point
             dragDistance = 0
             pressedTile = tile
+            if let tile, !isEditingApps {
+                let work = DispatchWorkItem { [weak self, weak tile] in
+                    guard let self, let tile, self.pressedTile === tile, tile.superview === self.grid,
+                          self.dragDistance < 8, self.isPresented else { return }
+                    self.isEditingApps = true
+                    self.doneEditing.isHidden = false
+                    self.drawPage()
+                }
+                longPress = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+            }
             return nil
         case .leftMouseDragged:
             guard let start = dragStart else { return event }
             dragDistance = max(dragDistance, hypot(point.x - start.x, point.y - start.y))
+            if dragDistance >= 8 { longPress?.cancel() }
             return nil
         case .leftMouseUp:
             guard let start = dragStart else { return event }
             let tile = pressedTile
-            dragStart = nil
-            pressedTile = nil
+            resetPointerInteraction()
             let deltaX = point.x - start.x
             let deltaY = point.y - start.y
             let height = grid.bounds.height
@@ -720,6 +798,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             if dragDistance < 8, hypot(deltaX, deltaY) < 8 {
                 if let tile {
                     if tile.superview === grid && tile.frame.contains(point) { tile.performClick(nil) }
+                } else if isEditingApps {
+                    finishEditingApps()
                 } else {
                     closeLauncher()
                 }
@@ -728,6 +808,24 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         default:
             return event
         }
+    }
+    func resetPointerInteraction() {
+        longPress?.cancel()
+        longPress = nil
+        dragStart = nil
+        pressedTile = nil
+    }
+    @objc func finishEditingApps() {
+        isEditingApps = false
+        doneEditing.isHidden = true
+        drawPage()
+        window.makeFirstResponder(search)
+    }
+    func refreshCatalog() {
+        let installed = Item.installed()
+        guard installed != apps else { return }
+        apps = installed
+        updateSearch(resetPage: false)
     }
     @objc func resetSearch() {
         search.stringValue = ""
@@ -740,7 +838,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         window.makeFirstResponder(search)
     }
     func controlTextDidChange(_ notification: Notification) { updateSearch() }
-    func updateSearch() {
+    func updateSearch(resetPage: Bool = true) {
         let q = search.stringValue
         clearSearch.isHidden = q.isEmpty
         if q.isEmpty {
@@ -750,7 +848,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 $0.name.localizedCaseInsensitiveContains(q) || $0.url.lastPathComponent.localizedCaseInsensitiveContains(q)
             }
         }
-        page = 0
+        if resetPage { page = 0 }
         drawPage()
     }
     func recordOpen(_ identifier: String) {
@@ -814,6 +912,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             tile.action = #selector(clicked(_:))
             tile.toolTip = item.name
             grid.addSubview(tile)
+            if isEditingApps && item.canMoveToTrash {
+                addTrashButton(for: tile, appName: item.name)
+            }
         }
         if results.isEmpty {
             let message = showingFrequentApps && search.stringValue.isEmpty
@@ -846,15 +947,73 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             dot.alphaValue = dot.tag == page ? 1 : 0.38
         }
     }
+    func addTrashButton(for tile: AppTile, appName: String) {
+        let button = NSButton(frame: NSRect(x: tile.frame.minX, y: tile.frame.maxY - 23, width: 23, height: 23))
+        let label = "移到废纸篓：" + appName
+        button.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: label)
+        button.symbolConfiguration = .init(pointSize: 18, weight: .semibold)
+        button.isBordered = false
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
+        button.tag = tile.tag
+        button.target = self
+        button.action = #selector(confirmTrash(_:))
+        grid.addSubview(button)
+    }
+    @objc func confirmTrash(_ button: NSButton) {
+        guard isEditingApps, results.indices.contains(button.tag) else { return }
+        let item = results[button.tag]
+        guard item.canMoveToTrash else { return }
+        guard window.attachedSheet == nil else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "将「\(item.name)」移到废纸篓？"
+        alert.informativeText = item.url.path
+        alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
+        let moveButton = alert.addButton(withTitle: "移到废纸篓")
+        moveButton.hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, self.isPresented else { return }
+            self.window.makeFirstResponder(self.search)
+            if response == .alertSecondButtonReturn { self.moveToTrash(item) }
+        }
+    }
+
+    func moveToTrash(_ item: Item) {
+        guard item.canMoveToTrash, Item.installed().contains(item) else {
+            refreshCatalog()
+            return
+        }
+        do {
+            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+        } catch {
+            runLauncherAlert(NSAlert(error: error))
+        }
+        refreshCatalog()
+    }
+
+    @discardableResult
+    func runLauncherAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        // The launcher overlays the menu bar, above the default modal-panel level.
+        alert.window.level = NSWindow.Level(rawValue: window.level.rawValue + 1)
+        alert.window.collectionBehavior = window.collectionBehavior
+        return alert.runModal()
+    }
+
     @objc func dotClicked(_ sender: NSButton) { go(sender.tag) }
     @objc func clicked(_ sender: NSButton) { launch(sender.tag) }
     @objc func submit() { launch(page * capacity) }
     func launch(_ index: Int) {
-        guard results.indices.contains(index) else { return }
+        guard !isEditingApps, results.indices.contains(index) else { return }
         let item = results[index]
-        NSWorkspace.shared.openApplication(at: item.url, configuration: .init()) { [weak self] _, error in
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.allowsRunningApplicationSubstitution = false
+        NSWorkspace.shared.openApplication(at: item.url, configuration: configuration) { [weak self] _, error in
             DispatchQueue.main.async {
-                if let error { NSAlert(error: error).runModal() }
+                if let error {
+                    self?.refreshCatalog()
+                    self?.runLauncherAlert(NSAlert(error: error))
+                }
                 else {
                     self?.recordOpen(item.identifier)
                     self?.closeLauncher(animated: false)

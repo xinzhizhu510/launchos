@@ -946,7 +946,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
         let moveButton = alert.addButton(withTitle: "移到废纸篓")
         moveButton.hasDestructiveAction = true
-        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        guard runLauncherAlert(alert) == .alertSecondButtonReturn else { return }
 
         guard item.canMoveToTrash, Item.installed().contains(item) else {
             refreshCatalog()
@@ -955,9 +955,17 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         do {
             try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
         } catch {
-            NSAlert(error: error).runModal()
+            runLauncherAlert(NSAlert(error: error))
         }
         refreshCatalog()
+    }
+
+    @discardableResult
+    func runLauncherAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        // The launcher overlays the menu bar, above the default modal-panel level.
+        alert.window.level = NSWindow.Level(rawValue: window.level.rawValue + 1)
+        alert.window.collectionBehavior = window.collectionBehavior
+        return alert.runModal()
     }
 
     @objc func dotClicked(_ sender: NSButton) { go(sender.tag) }
@@ -970,7 +978,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             DispatchQueue.main.async {
                 if let error {
                     self?.refreshCatalog()
-                    NSAlert(error: error).runModal()
+                    self?.runLauncherAlert(NSAlert(error: error))
                 }
                 else {
                     self?.recordOpen(item.identifier)

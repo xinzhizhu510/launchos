@@ -25,8 +25,7 @@ struct Item: Equatable {
 
     static func installed(in folders: [URL] = applicationFolders) -> [Item] {
         let fm = FileManager.default
-        var items = [Item]()
-        var seen = Set<String>()
+        var items = [String: Item]()
         for root in folders {
             guard let files = fm.enumerator(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
             for case let url as URL in files where url.pathExtension.lowercased() == "app" {
@@ -34,13 +33,37 @@ struct Item: Equatable {
                 guard let bundle = Bundle(url: url), bundle.executableURL != nil,
                       bundle.bundleIdentifier != Bundle.main.bundleIdentifier else { continue }
                 let identifier = bundle.bundleIdentifier ?? url.path
-                guard seen.insert(identifier).inserted else { continue }
+                if let current = items[identifier], !isNewer(url, than: current.url) { continue }
                 let display = fm.displayName(atPath: url.path)
                 let name = display.hasSuffix(".app") ? String(display.dropLast(4)) : display
-                items.append(Item(url: url, name: name, identifier: identifier))
+                items[identifier] = Item(url: url, name: name, identifier: identifier)
             }
         }
-        return items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return items.values.sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.url.path < $1.url.path : order == .orderedAscending
+        }
+    }
+
+    static func isNewer(_ candidate: URL, than current: URL) -> Bool {
+        func versionInfo(_ url: URL) -> [String: Any] {
+            // Read the plist rather than cached Bundle metadata when a copy may have been updated in place.
+            let plist = url.appendingPathComponent("Contents/Info.plist")
+            guard let data = try? Data(contentsOf: plist),
+                  let info = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+            else { return [:] }
+            return info as? [String: Any] ?? [:]
+        }
+
+        let candidateInfo = versionInfo(candidate)
+        let currentInfo = versionInfo(current)
+        for key in ["CFBundleShortVersionString", "CFBundleVersion"] {
+            let left = candidateInfo[key] as? String ?? ""
+            let right = currentInfo[key] as? String ?? ""
+            let comparison = left.compare(right, options: .numeric)
+            if comparison != .orderedSame { return comparison == .orderedDescending }
+        }
+        return false
     }
 }
 
@@ -983,7 +1006,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     func launch(_ index: Int) {
         guard !isEditingApps, results.indices.contains(index) else { return }
         let item = results[index]
-        NSWorkspace.shared.openApplication(at: item.url, configuration: .init()) { [weak self] _, error in
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.allowsRunningApplicationSubstitution = false
+        NSWorkspace.shared.openApplication(at: item.url, configuration: configuration) { [weak self] _, error in
             DispatchQueue.main.async {
                 if let error {
                     self?.refreshCatalog()

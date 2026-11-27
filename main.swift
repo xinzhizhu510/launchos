@@ -13,14 +13,23 @@ struct Item: Equatable {
     static let applicationFolders = userApplicationFolders + [URL(fileURLWithPath: "/System/Applications", isDirectory: true)]
 
     var canMoveToTrash: Bool {
+        let keys: Set<URLResourceKey> = [
+            .isDirectoryKey, .isSymbolicLinkKey, .isUserImmutableKey, .isSystemImmutableKey, .volumeIsReadOnlyKey
+        ]
         guard identifier != Bundle.main.bundleIdentifier,
-              let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
-              values.isDirectory == true, values.isSymbolicLink == false else { return false }
+              let values = try? url.resourceValues(forKeys: keys),
+              values.isDirectory == true, values.isSymbolicLink == false,
+              values.isUserImmutable != true, values.isSystemImmutable != true,
+              values.volumeIsReadOnly != true else { return false }
         let resolvedPath = url.resolvingSymlinksInPath().path
-        guard !resolvedPath.hasPrefix("/System/") else { return false }
-        return Self.userApplicationFolders.contains {
-            resolvedPath.hasPrefix($0.resolvingSymlinksInPath().path + "/")
-        }
+        guard !resolvedPath.hasPrefix("/System/"),
+              Self.userApplicationFolders.contains(where: {
+                  resolvedPath.hasPrefix($0.resolvingSymlinksInPath().path + "/")
+              }) else { return false }
+        // Use a conservative ownership check for the inline action. Finder can handle other owners.
+        let attributes = try? FileManager.default.attributesOfItem(atPath: resolvedPath)
+        let owner = attributes?[.ownerAccountID] as? NSNumber
+        return owner?.uint32Value == getuid()
     }
 
     static func installed(in folders: [URL] = applicationFolders) -> [Item] {
@@ -191,6 +200,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var dragDistance: CGFloat = 0
     var longPress: DispatchWorkItem?
     var isEditingApps = false
+    var itemBeingMovedToTrash: Item?
+    var trashFailure: (item: Item, message: String)?
+    let trashQueue = DispatchQueue(label: "local.launchos.trash")
     var catalogTimer: Timer?
     let doneEditing = NSButton()
     let settings = NSButton()
@@ -303,7 +315,8 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         apps = Item.installed()
         updateSearch()
         catalogTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            guard let self, self.dragStart == nil, self.window.attachedSheet == nil, NSApp.modalWindow == nil else { return }
+            guard let self, self.itemBeingMovedToTrash == nil, self.dragStart == nil,
+                  self.window.attachedSheet == nil, NSApp.modalWindow == nil else { return }
             self.refreshCatalog()
         }
 
@@ -329,6 +342,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             }
             fadeWindow(to: 1, duration: 0.22)
         }
+        showTrashFailureIfNeeded()
     }
     func focusLauncher() {
         guard isPresented else { return }
@@ -822,7 +836,9 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         window.makeFirstResponder(search)
     }
     func refreshCatalog() {
-        let installed = Item.installed()
+        updateCatalog(Item.installed())
+    }
+    func updateCatalog(_ installed: [Item]) {
         guard installed != apps else { return }
         apps = installed
         updateSearch(resetPage: false)
@@ -913,7 +929,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             tile.toolTip = item.name
             grid.addSubview(tile)
             if isEditingApps && item.canMoveToTrash {
-                addTrashButton(for: tile, appName: item.name)
+                addTrashControl(for: tile, item: item)
             }
         }
         if results.isEmpty {
@@ -947,21 +963,32 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             dot.alphaValue = dot.tag == page ? 1 : 0.38
         }
     }
-    func addTrashButton(for tile: AppTile, appName: String) {
-        let button = NSButton(frame: NSRect(x: tile.frame.minX, y: tile.frame.maxY - 23, width: 23, height: 23))
-        let label = "移到废纸篓：" + appName
+    func addTrashControl(for tile: AppTile, item: Item) {
+        let frame = NSRect(x: tile.frame.minX, y: tile.frame.maxY - 23, width: 23, height: 23)
+        if item == itemBeingMovedToTrash {
+            let indicator = NSProgressIndicator(frame: frame.insetBy(dx: 3, dy: 3))
+            indicator.style = .spinning
+            indicator.controlSize = .small
+            indicator.setAccessibilityLabel("正在移到废纸篓：" + item.name)
+            grid.addSubview(indicator)
+            indicator.startAnimation(nil)
+            return
+        }
+        let button = NSButton(frame: frame)
+        let label = "移到废纸篓：" + item.name
         button.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: label)
         button.symbolConfiguration = .init(pointSize: 18, weight: .semibold)
         button.isBordered = false
         button.toolTip = label
         button.setAccessibilityLabel(label)
+        button.isEnabled = itemBeingMovedToTrash == nil
         button.tag = tile.tag
         button.target = self
         button.action = #selector(confirmTrash(_:))
         grid.addSubview(button)
     }
     @objc func confirmTrash(_ button: NSButton) {
-        guard isEditingApps, results.indices.contains(button.tag) else { return }
+        guard isEditingApps, itemBeingMovedToTrash == nil, results.indices.contains(button.tag) else { return }
         let item = results[button.tag]
         guard item.canMoveToTrash else { return }
         guard window.attachedSheet == nil else { return }
@@ -980,16 +1007,67 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     func moveToTrash(_ item: Item) {
-        guard item.canMoveToTrash, Item.installed().contains(item) else {
-            refreshCatalog()
-            return
+        itemBeingMovedToTrash = item
+        drawPage()
+        trashQueue.async { [weak self] in
+            let installed = Item.installed()
+            guard item.canMoveToTrash, installed.contains(item) else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.finishMovingToTrash(installed)
+                }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Let Finder put any authorization prompt above the fullscreen grid.
+                let launcherLevel = self.window.level
+                self.window.level = .normal
+                NSWorkspace.shared.recycle([item.url]) { [weak self] moved, error in
+                    let failure = moved.isEmpty
+                        ? (item, error?.localizedDescription ?? "macOS 未能将此应用移到废纸篓。")
+                        : nil
+                    self?.trashQueue.async { [weak self] in
+                        let installed = Item.installed()
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self else { return }
+                            self.window.level = launcherLevel
+                            self.trashFailure = failure
+                            self.finishMovingToTrash(installed)
+                            self.showTrashFailureIfNeeded()
+                        }
+                    }
+                }
+            }
         }
-        do {
-            try FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-        } catch {
-            runLauncherAlert(NSAlert(error: error))
+    }
+
+    func finishMovingToTrash(_ installed: [Item]) {
+        itemBeingMovedToTrash = nil
+        if installed == apps {
+            drawPage()
+        } else {
+            updateCatalog(installed)
         }
-        refreshCatalog()
+    }
+
+    func showTrashFailureIfNeeded() {
+        guard isPresented, window.attachedSheet == nil, let failure = trashFailure else { return }
+        trashFailure = nil
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "无法将「\(failure.item.name)」移到废纸篓"
+        alert.informativeText = failure.message
+        alert.addButton(withTitle: "好").keyEquivalent = "\u{1b}"
+        alert.addButton(withTitle: "在访达中显示")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, self.isPresented else { return }
+            if response == .alertSecondButtonReturn {
+                self.closeLauncher(animated: false)
+                NSWorkspace.shared.activateFileViewerSelecting([failure.item.url])
+            } else {
+                self.window.makeFirstResponder(self.search)
+            }
+        }
     }
 
     @discardableResult

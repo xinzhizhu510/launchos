@@ -168,6 +168,10 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     var dragDistance: CGFloat = 0
     var longPress: DispatchWorkItem?
     var isEditingApps = false
+    var trashOverlay: NSView?
+    var pendingTrash: Item?
+    let cancelTrashButton = NSButton()
+    let moveToTrashButton = NSButton()
     var catalogTimer: Timer?
     let doneEditing = NSButton()
     let settings = NSButton()
@@ -280,7 +284,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         apps = Item.installed()
         updateSearch()
         catalogTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            guard let self, self.dragStart == nil, NSApp.modalWindow == nil else { return }
+            guard let self, self.dragStart == nil, self.trashOverlay == nil, NSApp.modalWindow == nil else { return }
             self.refreshCatalog()
         }
 
@@ -324,6 +328,7 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         catalogTimer?.invalidate()
         catalogTimer = nil
         resetPointerInteraction()
+        dismissTrashConfirmation(restoreFocus: false)
         isEditingApps = false
         doneEditing.isHidden = true
         preferences.close()
@@ -678,6 +683,24 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     func handle(_ event: NSEvent) -> NSEvent? {
         guard NSApp.modalWindow == nil else { return event }
+        if trashOverlay != nil && event.window === window {
+            switch event.type {
+            case .keyDown:
+                switch event.keyCode {
+                case 53: cancelTrash()
+                case 48:
+                    let next = window.firstResponder === cancelTrashButton ? moveToTrashButton : cancelTrashButton
+                    window.makeFirstResponder(next)
+                case 36, 76:
+                    let focused = window.firstResponder === moveToTrashButton ? moveToTrashButton : cancelTrashButton
+                    focused.performClick(nil)
+                default: break
+                }
+                return nil
+            case .scrollWheel, .swipe: return nil
+            default: return event
+            }
+        }
         if event.type == .keyDown, event.keyCode == 53, NSApp.isActive {
             if isEditingApps { finishEditingApps() }
             else { closeLauncher() }
@@ -940,13 +963,75 @@ final class Launcher: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         guard isEditingApps, results.indices.contains(button.tag) else { return }
         let item = results[button.tag]
         guard item.canMoveToTrash else { return }
-        let alert = NSAlert()
-        alert.messageText = "将「\(item.name)」移到废纸篓？"
-        alert.informativeText = item.url.path
-        alert.addButton(withTitle: "取消").keyEquivalent = "\u{1b}"
-        let moveButton = alert.addButton(withTitle: "移到废纸篓")
-        moveButton.hasDestructiveAction = true
-        guard runLauncherAlert(alert) == .alertSecondButtonReturn else { return }
+        showTrashConfirmation(for: item)
+    }
+
+    func showTrashConfirmation(for item: Item) {
+        guard trashOverlay == nil else { return }
+        pendingTrash = item
+        let overlay = NSView(frame: background.bounds)
+        overlay.autoresizingMask = [.width, .height]
+        overlay.wantsLayer = true
+        overlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
+
+        let width = min(440, overlay.bounds.width - 32)
+        let card = NSView(frame: NSRect(x: overlay.bounds.midX - width / 2,
+                                       y: overlay.bounds.midY - 86, width: width, height: 172))
+        card.autoresizingMask = [.minXMargin, .maxXMargin, .minYMargin, .maxYMargin]
+        styleControl(card, radius: 20)
+        card.layer?.backgroundColor = NSColor(calibratedWhite: 0.14, alpha: 1).cgColor
+        overlay.addSubview(card)
+
+        let title = NSTextField(wrappingLabelWithString: "将「\(item.name)」移到废纸篓？")
+        title.font = .systemFont(ofSize: 19, weight: .semibold)
+        title.maximumNumberOfLines = 2
+        title.frame = NSRect(x: 24, y: 104, width: width - 48, height: 44)
+        card.addSubview(title)
+
+        let path = NSTextField(wrappingLabelWithString: item.url.path)
+        path.font = .systemFont(ofSize: 13)
+        path.textColor = .secondaryLabelColor
+        path.maximumNumberOfLines = 2
+        path.lineBreakMode = .byTruncatingMiddle
+        path.toolTip = item.url.path
+        path.frame = NSRect(x: 24, y: 65, width: width - 48, height: 32)
+        card.addSubview(path)
+
+        cancelTrashButton.title = "取消"
+        cancelTrashButton.bezelStyle = .rounded
+        cancelTrashButton.target = self
+        cancelTrashButton.action = #selector(cancelTrash)
+        cancelTrashButton.frame = NSRect(x: width - 219, y: 21, width: 82, height: 28)
+        card.addSubview(cancelTrashButton)
+
+        moveToTrashButton.title = "移到废纸篓"
+        moveToTrashButton.bezelStyle = .rounded
+        moveToTrashButton.hasDestructiveAction = true
+        moveToTrashButton.target = self
+        moveToTrashButton.action = #selector(moveConfirmedItemToTrash)
+        moveToTrashButton.frame = NSRect(x: width - 130, y: 21, width: 106, height: 28)
+        card.addSubview(moveToTrashButton)
+
+        trashOverlay = overlay
+        background.addSubview(overlay, positioned: .above, relativeTo: nil)
+        window.makeFirstResponder(cancelTrashButton)
+    }
+
+    func dismissTrashConfirmation(restoreFocus: Bool = true) {
+        guard let overlay = trashOverlay else { return }
+        overlay.removeFromSuperview()
+        trashOverlay = nil
+        pendingTrash = nil
+        if restoreFocus { window.makeFirstResponder(search) }
+    }
+
+    @objc func cancelTrash() {
+        dismissTrashConfirmation()
+    }
+
+    @objc func moveConfirmedItemToTrash() {
+        guard let item = pendingTrash else { return }
+        dismissTrashConfirmation()
 
         guard item.canMoveToTrash, Item.installed().contains(item) else {
             refreshCatalog()
